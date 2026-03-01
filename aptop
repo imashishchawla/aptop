@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""aptop Phase 2: btop-like Apple Silicon monitor with real macOS collectors.
+
+Phase 2 scope:
+- real CPU/memory/disk/network/process metrics
+- same layout from phase 1
+- GPU chart stays placeholder until powermetrics integration (phase 3)
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import random
+import re
+import shutil
+import signal
+import subprocess
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import List
+
+REFRESH_MS_DEFAULT = 500
+HISTORY = 160
+
+
+@dataclass
+class ProcRow:
+    pid: int
+    user: str
+    mem_gb: float
+    cpu_pct: float
+    command: str
+
+
+@dataclass
+class PanelData:
+    cpu: deque[float]
+    gpu: deque[float]
+    mem_used_pct: float
+    mem_cached_pct: float
+    mem_free_pct: float
+    mem_used_gb: float
+    mem_total_gb: float
+    disk_used_pct: float
+    swap_used_pct: float
+    net_up: deque[float]
+    net_down: deque[float]
+    net_up_human: str
+    net_down_human: str
+    proc_rows: List[ProcRow]
+
+
+def run_cmd(cmd: list[str], timeout: float = 0.8) -> str:
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
+        return out.strip()
+    except Exception:
+        return ""
+
+
+def human_rate(value_bps: float) -> str:
+    units = ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"]
+    v = max(0.0, value_bps)
+    idx = 0
+    while v >= 1024.0 and idx < len(units) - 1:
+        v /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{v:.0f} {units[idx]}"
+    return f"{v:.2f} {units[idx]}"
+
+
+def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, v))
+
+
+class MacSampler:
+    def __init__(self, history: int) -> None:
+        self.cpu = deque([0.0] * history, maxlen=history)
+        self.gpu = deque([0.0] * history, maxlen=history)
+        self.net_up = deque([0.0] * history, maxlen=history)
+        self.net_down = deque([0.0] * history, maxlen=history)
+
+        self.total_mem_bytes = self._read_total_mem()
+        self.default_if = self._default_interface()
+
+        self.last_net_ts = 0.0
+        self.last_net_in = 0
+        self.last_net_out = 0
+        self.peak_down_bps = 1.0
+        self.peak_up_bps = 1.0
+
+    def _read_total_mem(self) -> int:
+        out = run_cmd(["sysctl", "-n", "hw.memsize"])
+        try:
+            return int(out)
+        except ValueError:
+            return 0
+
+    def _default_interface(self) -> str:
+        out = run_cmd(["route", "-n", "get", "default"])
+        for line in out.splitlines():
+            if "interface:" in line:
+                return line.split("interface:", 1)[1].strip()
+        return "en0"
+
+    def _cpu_percent(self) -> float:
+        out = run_cmd(["top", "-l", "1", "-n", "0"])
+        m = re.search(r"CPU usage:\s*([0-9.]+)% user,\s*([0-9.]+)% sys,\s*([0-9.]+)% idle", out)
+        if m:
+            try:
+                idle = float(m.group(3))
+                return clamp(100.0 - idle)
+            except ValueError:
+                return self.cpu[-1]
+        return self.cpu[-1]
+
+    def _memory(self) -> tuple[float, float, float, float, float]:
+        vm = run_cmd(["vm_stat"])
+        if not vm:
+            used_pct = self.cpu[-1] * 0.4
+            return used_pct, 20.0, 80.0 - used_pct, 0.0, 0.0
+
+        page_size = 4096
+        m_page = re.search(r"page size of\s+(\d+)\s+bytes", vm)
+        if m_page:
+            page_size = int(m_page.group(1))
+
+        stats: dict[str, int] = {}
+        for line in vm.splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            value_num = "".join(ch for ch in value if ch.isdigit())
+            if value_num:
+                stats[key.strip()] = int(value_num)
+
+        free = stats.get("Pages free", 0)
+        speculative = stats.get("Pages speculative", 0)
+        inactive = stats.get("Pages inactive", 0)
+        purgeable = stats.get("Pages purgeable", 0)
+        active = stats.get("Pages active", 0)
+        wired = stats.get("Pages wired down", 0)
+        compressed = stats.get("Pages occupied by compressor", 0)
+
+        used_pages = active + wired + compressed
+        cached_pages = inactive + speculative + purgeable
+        free_pages = free
+
+        used_bytes = used_pages * page_size
+        cached_bytes = cached_pages * page_size
+        free_bytes = free_pages * page_size
+
+        total_bytes = self.total_mem_bytes if self.total_mem_bytes > 0 else max(1, used_bytes + cached_bytes + free_bytes)
+        used_pct = clamp((used_bytes / total_bytes) * 100.0)
+        cached_pct = clamp((cached_bytes / total_bytes) * 100.0)
+        free_pct = clamp((free_bytes / total_bytes) * 100.0)
+
+        return used_pct, cached_pct, free_pct, used_bytes / (1024**3), total_bytes / (1024**3)
+
+    def _disk(self) -> tuple[float, float]:
+        du = shutil.disk_usage("/")
+        used_pct = clamp((du.used / max(1, du.total)) * 100.0)
+
+        swap_out = run_cmd(["sysctl", "vm.swapusage"])
+        swap_used_pct = 0.0
+        m = re.search(r"used\s*=\s*([0-9.]+)([MGT])", swap_out)
+        t = re.search(r"total\s*=\s*([0-9.]+)([MGT])", swap_out)
+        if m and t:
+            mult = {"M": 1.0, "G": 1024.0, "T": 1024.0 * 1024.0}
+            used_mb = float(m.group(1)) * mult[m.group(2)]
+            total_mb = float(t.group(1)) * mult[t.group(2)]
+            swap_used_pct = clamp((used_mb / max(1.0, total_mb)) * 100.0)
+
+        return used_pct, swap_used_pct
+
+    def _interface_bytes(self) -> tuple[int, int]:
+        out = run_cmd(["netstat", "-b", "-n", "-I", self.default_if])
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        for line in reversed(lines):
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            try:
+                ibytes = int(parts[6])
+                obytes = int(parts[9])
+                return ibytes, obytes
+            except ValueError:
+                continue
+        return self.last_net_in, self.last_net_out
+
+    def _network(self) -> tuple[float, float, str, str]:
+        now = time.time()
+        ibytes, obytes = self._interface_bytes()
+
+        if self.last_net_ts == 0.0:
+            self.last_net_ts = now
+            self.last_net_in = ibytes
+            self.last_net_out = obytes
+            return 0.0, 0.0, "0 B/s", "0 B/s"
+
+        dt = max(0.001, now - self.last_net_ts)
+        down_bps = max(0.0, (ibytes - self.last_net_in) / dt)
+        up_bps = max(0.0, (obytes - self.last_net_out) / dt)
+
+        self.last_net_ts = now
+        self.last_net_in = ibytes
+        self.last_net_out = obytes
+
+        self.peak_down_bps = max(self.peak_down_bps * 0.997, down_bps, 1.0)
+        self.peak_up_bps = max(self.peak_up_bps * 0.997, up_bps, 1.0)
+
+        down_pct = clamp((down_bps / self.peak_down_bps) * 100.0)
+        up_pct = clamp((up_bps / self.peak_up_bps) * 100.0)
+        return down_pct, up_pct, human_rate(down_bps), human_rate(up_bps)
+
+    def _processes(self, limit: int = 48) -> List[ProcRow]:
+        out = run_cmd(["ps", "-Ao", "pid,user,rss,pcpu,comm", "-r"])
+        rows: List[ProcRow] = []
+        for line in out.splitlines()[1 : limit + 1]:
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            try:
+                pid = int(parts[0])
+                user = parts[1]
+                rss_kb = int(parts[2])
+                cpu_pct = float(parts[3])
+                cmd = parts[4].split("/")[-1]
+            except ValueError:
+                continue
+            rows.append(ProcRow(pid=pid, user=user, mem_gb=rss_kb / (1024 * 1024), cpu_pct=cpu_pct, command=cmd))
+        return rows
+
+    def _gpu_placeholder(self, cpu_pct: float) -> float:
+        # Phase 3 will replace this with powermetrics-backed GPU utilization.
+        prev = self.gpu[-1] if self.gpu else 8.0
+        target = cpu_pct * 0.55 + random.uniform(-8.0, 8.0)
+        return clamp(prev * 0.7 + target * 0.3)
+
+    def sample(self) -> PanelData:
+        cpu_pct = self._cpu_percent()
+        mem_used_pct, mem_cached_pct, mem_free_pct, mem_used_gb, mem_total_gb = self._memory()
+        disk_used_pct, swap_used_pct = self._disk()
+        down_pct, up_pct, down_h, up_h = self._network()
+        procs = self._processes()
+        gpu_pct = self._gpu_placeholder(cpu_pct)
+
+        self.cpu.append(cpu_pct)
+        self.gpu.append(gpu_pct)
+        self.net_down.append(down_pct)
+        self.net_up.append(up_pct)
+
+        return PanelData(
+            cpu=self.cpu,
+            gpu=self.gpu,
+            mem_used_pct=mem_used_pct,
+            mem_cached_pct=mem_cached_pct,
+            mem_free_pct=mem_free_pct,
+            mem_used_gb=mem_used_gb,
+            mem_total_gb=mem_total_gb,
+            disk_used_pct=disk_used_pct,
+            swap_used_pct=swap_used_pct,
+            net_up=self.net_up,
+            net_down=self.net_down,
+            net_up_human=up_h,
+            net_down_human=down_h,
+            proc_rows=procs,
+        )
+
+
+def init_colors() -> None:
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    curses.init_pair(4, curses.COLOR_CYAN, -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(6, curses.COLOR_WHITE, -1)
+
+
+def pct_color(p: float) -> int:
+    if p < 60:
+        return curses.color_pair(1)
+    if p < 85:
+        return curses.color_pair(2)
+    return curses.color_pair(3)
+
+
+def safe_addstr(stdscr: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
+    max_y, max_x = stdscr.getmaxyx()
+    if y < 0 or x < 0 or y >= max_y or x >= max_x:
+        return
+    clipped = text[: max(0, max_x - x)]
+    if not clipped:
+        return
+    try:
+        stdscr.addstr(y, x, clipped, attr)
+    except curses.error:
+        pass
+
+
+def draw_box(stdscr: curses.window, y: int, x: int, h: int, w: int, title: str) -> None:
+    if h < 3 or w < 6:
+        return
+    safe_addstr(stdscr, y, x, "+" + "-" * (w - 2) + "+", curses.color_pair(1))
+    for i in range(1, h - 1):
+        safe_addstr(stdscr, y + i, x, "|", curses.color_pair(1))
+        safe_addstr(stdscr, y + i, x + w - 1, "|", curses.color_pair(1))
+    safe_addstr(stdscr, y + h - 1, x, "+" + "-" * (w - 2) + "+", curses.color_pair(1))
+    if len(title) < (w - 4):
+        safe_addstr(stdscr, y, x + 2, title, curses.A_BOLD)
+
+
+def draw_sparkline(stdscr: curses.window, y: int, x: int, h: int, w: int, values: deque[float], label: str, color: int) -> None:
+    if h < 4 or w < 12:
+        return
+    safe_addstr(stdscr, y, x, label, curses.A_BOLD | color)
+    chars = " .:-=+*#%@"
+    data = list(values)
+    if not data:
+        return
+    step = max(1, len(data) // max(1, (w - 2)))
+    sliced = data[-(w - 2) * step :]
+    cols = [sum(sliced[i : i + step]) / step for i in range(0, len(sliced), step)]
+    cols = cols[-(w - 2) :]
+    for i, p in enumerate(cols):
+        level = int((p / 100.0) * (len(chars) - 1))
+        level = max(0, min(len(chars) - 1, level))
+        bar_h = int((p / 100.0) * (h - 2))
+        bar_h = max(1, bar_h)
+        ch = chars[level]
+        for j in range(bar_h):
+            yy = y + h - 2 - j
+            if yy <= y:
+                break
+            safe_addstr(stdscr, yy, x + 1 + i, ch, pct_color(p))
+
+
+def draw_progress(stdscr: curses.window, y: int, x: int, w: int, label: str, pct: float, color: int) -> None:
+    if w < 16:
+        return
+    bar_w = max(6, w - 18)
+    fill = int((pct / 100.0) * bar_w)
+    fill = max(0, min(bar_w, fill))
+    safe_addstr(stdscr, y, x, f"{label:<8}", curses.A_BOLD)
+    safe_addstr(stdscr, y, x + 8, "[" + "#" * fill + "-" * (bar_w - fill) + "]", color)
+    safe_addstr(stdscr, y, x + 10 + bar_w, f"{pct:5.1f}%")
+
+
+def draw_processes(stdscr: curses.window, y: int, x: int, h: int, w: int, rows: List[ProcRow]) -> None:
+    if h < 6 or w < 30:
+        return
+    safe_addstr(stdscr, y + 1, x + 2, "PID    USER     MEM     CPU   PROCESS", curses.A_BOLD)
+    visible = h - 4
+    for i, row in enumerate(rows[:visible]):
+        line = f"{row.pid:<6} {row.user[:8]:<8} {row.mem_gb:>4.1f}G  {row.cpu_pct:>5.1f}%  {row.command}"
+        color = curses.color_pair(1) if i % 2 == 0 else curses.color_pair(4)
+        safe_addstr(stdscr, y + 2 + i, x + 2, line[: max(1, w - 4)], color)
+
+
+def draw_ui(stdscr: curses.window, data: PanelData, interval_ms: int, default_if: str) -> None:
+    stdscr.erase()
+    max_y, max_x = stdscr.getmaxyx()
+    if max_y < 28 or max_x < 110:
+        safe_addstr(stdscr, 1, 2, "aptop Phase 2 requires at least 110x28 terminal size.", curses.A_BOLD)
+        safe_addstr(stdscr, 3, 2, f"Current: {max_x}x{max_y}")
+        safe_addstr(stdscr, 5, 2, "Resize terminal and rerun.")
+        stdscr.refresh()
+        return
+
+    now = time.strftime("%H:%M:%S")
+    header = f" aptop  phase-2  refresh={interval_ms}ms  iface={default_if}  q=quit r=reset  {now}"
+    safe_addstr(stdscr, 0, 1, header[: max_x - 2], curses.A_BOLD | curses.color_pair(6))
+
+    top_h = max_y // 2
+    bottom_h = max_y - top_h - 1
+
+    draw_box(stdscr, 1, 0, top_h, max_x, "1 cpu + gpu")
+
+    graph_h = top_h - 4
+    graph_w = max_x - 4
+    cpu_h = graph_h // 2
+    gpu_h = graph_h - cpu_h
+    draw_sparkline(stdscr, 3, 2, cpu_h, graph_w, data.cpu, f"CPU {data.cpu[-1]:5.1f}%", curses.color_pair(1))
+    draw_sparkline(
+        stdscr,
+        3 + cpu_h,
+        2,
+        gpu_h,
+        graph_w,
+        data.gpu,
+        f"GPU {data.gpu[-1]:5.1f}% (phase-2 placeholder)",
+        curses.color_pair(5),
+    )
+
+    by = 1 + top_h
+    left_w = max_x // 2
+    right_w = max_x - left_w
+
+    left_top_h = bottom_h // 2
+    left_bottom_h = bottom_h - left_top_h
+
+    mem_w = left_w // 2
+    disk_w = left_w - mem_w
+
+    draw_box(stdscr, by, 0, left_top_h, mem_w, "2 mem")
+    draw_box(stdscr, by, mem_w, left_top_h, disk_w, "3 disks")
+    draw_box(stdscr, by + left_top_h, 0, left_bottom_h, left_w, "4 net")
+    draw_box(stdscr, by, left_w, bottom_h, right_w, "5 proc")
+
+    draw_progress(stdscr, by + 2, 2, mem_w - 4, "Used", data.mem_used_pct, pct_color(data.mem_used_pct))
+    draw_progress(stdscr, by + 4, 2, mem_w - 4, "Cached", data.mem_cached_pct, curses.color_pair(4))
+    draw_progress(stdscr, by + 6, 2, mem_w - 4, "Free", data.mem_free_pct, curses.color_pair(1))
+    safe_addstr(stdscr, by + left_top_h - 2, 2, f"{data.mem_used_gb:.1f} GiB / {data.mem_total_gb:.1f} GiB")
+
+    draw_progress(stdscr, by + 2, mem_w + 2, disk_w - 4, "Root", data.disk_used_pct, pct_color(data.disk_used_pct))
+    draw_progress(stdscr, by + 4, mem_w + 2, disk_w - 4, "Swap", data.swap_used_pct, pct_color(data.swap_used_pct))
+
+    net_y = by + left_top_h + 2
+    net_h = max(6, left_bottom_h - 3)
+    net_w = left_w - 4
+    draw_sparkline(stdscr, net_y, 2, net_h // 2, net_w, data.net_down, f"DOWN {data.net_down_human}", curses.color_pair(4))
+    draw_sparkline(stdscr, net_y + net_h // 2, 2, net_h - (net_h // 2), net_w, data.net_up, f"UP   {data.net_up_human}", curses.color_pair(5))
+
+    draw_processes(stdscr, by, left_w, bottom_h, right_w, data.proc_rows)
+
+    footer = "Phase 2: real cpu/mem/disk/net/process on macOS. Phase 3 will replace GPU placeholder with powermetrics."
+    safe_addstr(stdscr, max_y - 1, 1, footer[: max_x - 2], curses.color_pair(6))
+    stdscr.refresh()
+
+
+def run(stdscr: curses.window, interval_ms: int) -> None:
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(interval_ms)
+    init_colors()
+
+    sampler = MacSampler(HISTORY)
+
+    while True:
+        data = sampler.sample()
+        draw_ui(stdscr, data, interval_ms, sampler.default_if)
+        ch = stdscr.getch()
+
+        if ch in (ord("q"), ord("Q")):
+            return
+        if ch in (ord("r"), ord("R")):
+            sampler = MacSampler(HISTORY)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="aptop Phase 2 macOS collector UI")
+    parser.add_argument("--interval-ms", type=int, default=REFRESH_MS_DEFAULT, help="UI refresh interval in milliseconds")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    interval_ms = max(180, min(3000, args.interval_ms))
+
+    signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    try:
+        curses.wrapper(lambda stdscr: run(stdscr, interval_ms))
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
