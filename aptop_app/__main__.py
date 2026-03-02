@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""aptop executable entrypoint."""
-
 from aptop_app.main import main
 
 

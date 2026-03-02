@@ -2,29 +2,47 @@
 
 Apple Silicon terminal monitor inspired by `btop`, `htop`, and `nvtop`.
 
-## Phase 2 status
+## Phase 3 status
 
-Phase 2 keeps the target layout and adds real macOS system collectors.
+Phase 3 is implemented with a modular codebase and real power telemetry integration.
 
 Implemented:
-- 4-region layout:
+- 4-region layout (same target geometry):
   - top half: CPU + GPU graph area
-  - bottom-left top: memory and disks split
-  - bottom-left bottom: network graph
+  - bottom-left top: memory + disks
+  - bottom-left bottom: network
   - bottom-right half: process pane
 - Real collectors (macOS):
-  - CPU: `top -l 1`
+  - CPU: `top -l 1 -n 0`
   - Memory: `vm_stat` + `sysctl hw.memsize`
-  - Disk + swap: `disk_usage(/)` + `sysctl vm.swapusage`
+  - Disk + swap: filesystem usage + `sysctl vm.swapusage`
   - Network throughput: `route` + `netstat`
-  - Process table: `ps -Ao pid,user,rss,pcpu,comm -r`
-- Keybinds:
-  - `q`: quit
-  - `r`: reset sampler state
+  - Processes: `ps -Ao pid,user,rss,pcpu,comm -r`
+- Power + battery telemetry:
+  - `pmset -g batt` (AC/battery source + percent/state)
+  - `ioreg -r -n AppleSmartBattery -a` (adapter W/V/A when available)
+  - `powermetrics` (GPU utilization + CPU/GPU/ANE power)
+- Graceful fallback:
+  - if `powermetrics` is unavailable/not sudo, GPU graph uses fallback estimator and UI clearly shows status.
+- Process pane behavior:
+  - default sort is memory high to low
+  - smooth auto-scroll when rows exceed visible space
+- Top detail behavior:
+  - mirrored CPU graph style
+  - CPU/GPU per-core bars
+  - GPU memory utilization shown when available, otherwise `--`
 
-Current limitation:
-- GPU graph is still a placeholder in Phase 2.
-  - Phase 3 will replace it with `powermetrics`-backed GPU metrics.
+## Code layout
+
+- Entry command:
+  - `aptop`
+- Application package:
+  - `aptop_app/main.py`
+  - `aptop_app/models.py`
+  - `aptop_app/utils.py`
+  - `aptop_app/collectors/system.py`
+  - `aptop_app/collectors/power.py`
+  - `aptop_app/ui/render.py`
 
 ## Run
 
@@ -36,8 +54,16 @@ cd /Users/ashishchawla/Documents/My-DIY-Projects/thepiProject/aptop
 Optional:
 
 ```bash
-./aptop --interval-ms 500
+./aptop --interval-ms 700
+sudo ./aptop --interval-ms 700
 ```
+
+Use `sudo` to unlock full `powermetrics` telemetry.
+
+## Keys
+
+- `q`: quit
+- `r`: reset samplers
 
 ## Terminal size
 
