@@ -17,6 +17,8 @@ class ProcRow:
 @dataclass
 class SystemMetrics:
     cpu_pct: float
+    load_avg: str
+    uptime: str
     mem_used_pct: float
     mem_cached_pct: float
     mem_free_pct: float
@@ -54,6 +56,8 @@ class PowerMetrics:
 class PanelData:
     cpu: deque[float]
     gpu: deque[float]
+    load_avg: str
+    uptime: str
     mem_used_pct: float
     mem_cached_pct: float
     mem_free_pct: float

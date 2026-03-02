@@ -45,6 +45,20 @@ class SystemCollector:
         except ValueError:
             return 0.0
 
+    def _uptime_load(self) -> tuple[str, str]:
+        out = run_cmd(["uptime"])
+        if not out:
+            return "0.00 0.00 0.00", "--"
+        load = "0.00 0.00 0.00"
+        up = "--"
+        m_load = re.search(r"load averages?:\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)", out)
+        if m_load:
+            load = f"{m_load.group(1)} {m_load.group(2)} {m_load.group(3)}"
+        m_up = re.search(r"up\s+(.+?),\s+\d+\s+users?", out)
+        if m_up:
+            up = m_up.group(1).strip()
+        return load, up
+
     def _memory(self) -> tuple[float, float, float, float, float]:
         vm = run_cmd(["vm_stat"])
         if not vm:
@@ -165,6 +179,7 @@ class SystemCollector:
 
     def sample(self) -> SystemMetrics:
         cpu_pct = self._cpu_percent()
+        load_avg, uptime = self._uptime_load()
         mem_used_pct, mem_cached_pct, mem_free_pct, mem_used_gb, mem_total_gb = self._memory()
         disk_used_pct, swap_used_pct = self._disk()
         down_pct, up_pct, down_h, up_h = self._network()
@@ -172,6 +187,8 @@ class SystemCollector:
 
         return SystemMetrics(
             cpu_pct=cpu_pct,
+            load_avg=load_avg,
+            uptime=uptime,
             mem_used_pct=mem_used_pct,
             mem_cached_pct=mem_cached_pct,
             mem_free_pct=mem_free_pct,

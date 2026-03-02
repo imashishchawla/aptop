@@ -63,6 +63,8 @@ class AppSampler:
         return PanelData(
             cpu=self.cpu_hist,
             gpu=self.gpu_hist,
+            load_avg=sysm.load_avg,
+            uptime=sysm.uptime,
             mem_used_pct=sysm.mem_used_pct,
             mem_cached_pct=sysm.mem_cached_pct,
             mem_free_pct=sysm.mem_free_pct,
@@ -105,17 +107,29 @@ def run(stdscr: curses.window, interval_ms: int) -> None:
 
     sampler = AppSampler(HISTORY)
     frame = 0
+    manual_scroll = 0
+    auto_scroll = True
 
     while True:
         frame += 1
         data = sampler.sample()
-        draw_ui(stdscr, data, interval_ms, sampler.system.default_if, frame)
+        draw_ui(stdscr, data, interval_ms, sampler.system.default_if, frame, manual_scroll, auto_scroll)
 
         ch = stdscr.getch()
         if ch in (ord("q"), ord("Q")):
             return
         if ch in (ord("r"), ord("R")):
             sampler = AppSampler(HISTORY)
+            manual_scroll = 0
+            auto_scroll = True
+        if ch in (ord("j"), curses.KEY_DOWN):
+            manual_scroll += 1
+            auto_scroll = False
+        if ch in (ord("k"), curses.KEY_UP):
+            manual_scroll -= 1
+            auto_scroll = False
+        if ch in (ord("a"), ord("A")):
+            auto_scroll = not auto_scroll
 
 
 def parse_args() -> argparse.Namespace:

@@ -18,6 +18,7 @@ class PowerCollector:
     def __init__(self, min_interval_sec: float = 1.8) -> None:
         self.min_interval_sec = min_interval_sec
         self.last_sample_at = 0.0
+        self.error_backoff_sec = 1.8
         self.gpu_core_count = self._gpu_core_count()
         self.cached = PowerMetrics(
             gpu_util_pct=None,
@@ -39,7 +40,7 @@ class PowerCollector:
 
     def _gpu_core_count(self) -> int:
         try:
-            raw = subprocess.check_output(["ioreg", "-r", "-n", "AGXAccelerator", "-a"], timeout=1.0)
+            raw = subprocess.check_output(["ioreg", "-r", "-a", "-c", "AGXAccelerator"], timeout=1.0)
             data = plistlib.loads(raw)
             if isinstance(data, list) and data and isinstance(data[0], dict):
                 core = data[0].get("gpu-core-count")
@@ -182,7 +183,8 @@ class PowerCollector:
 
     def sample(self, force: bool = False) -> PowerMetrics:
         now = time.time()
-        if not force and (now - self.last_sample_at) < self.min_interval_sec:
+        min_interval = max(self.min_interval_sec, self.error_backoff_sec)
+        if not force and (now - self.last_sample_at) < min_interval:
             return self.cached
 
         source, batt_pct, batt_state = self._pmset()
@@ -207,5 +209,7 @@ class PowerCollector:
             powermetrics_ok=ok,
             powermetrics_error=err,
         )
+        # Back off expensive retries if powermetrics is unavailable/not privileged.
+        self.error_backoff_sec = 1.8 if ok else 10.0
         self.last_sample_at = now
         return self.cached

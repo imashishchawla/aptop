@@ -23,6 +23,7 @@ def init_colors() -> None:
     curses.init_pair(4, curses.COLOR_CYAN, -1)
     curses.init_pair(5, curses.COLOR_MAGENTA, -1)
     curses.init_pair(6, curses.COLOR_WHITE, -1)
+    curses.init_pair(7, curses.COLOR_BLUE, -1)
 
 
 def pct_color(p: float) -> int:
@@ -86,13 +87,13 @@ def draw_sparkline(stdscr: curses.window, y: int, x: int, h: int, w: int, values
 def draw_mirror_graph(stdscr: curses.window, y: int, x: int, h: int, w: int, values: deque[float], label: str) -> None:
     if h < 6 or w < 20:
         return
-    safe_addstr(stdscr, y, x, label, curses.A_BOLD | curses.color_pair(1))
+    safe_addstr(stdscr, y, x, label, curses.A_BOLD | curses.color_pair(4))
     data = list(values)
     if not data:
         return
 
     baseline = y + (h // 2)
-    safe_addstr(stdscr, baseline, x + 1, "-" * max(0, w - 2), curses.color_pair(1))
+    safe_addstr(stdscr, baseline, x + 1, "-" * max(0, w - 2), curses.color_pair(2))
 
     step = max(1, len(data) // max(1, (w - 2)))
     sliced = data[-(w - 2) * step :]
@@ -133,7 +134,7 @@ def draw_processes(stdscr: curses.window, y: int, x: int, h: int, w: int, rows: 
     ordered = rows[start:] + rows[:start]
     for i, row in enumerate(ordered[:visible]):
         line = f"{row.pid:<6} {row.user[:8]:<8} {row.mem_gb:>4.1f}G  {row.cpu_pct:>5.1f}%  {row.command}"
-        color = curses.color_pair(1) if i % 2 == 0 else curses.color_pair(4)
+        color = curses.color_pair(1) if i % 2 == 0 else curses.color_pair(7)
         safe_addstr(stdscr, y + 2 + i, x + 2, line[: max(1, w - 4)], color)
 
 
@@ -176,7 +177,7 @@ def draw_top_detail(stdscr: curses.window, y: int, x: int, w: int, h: int, data:
     safe_addstr(stdscr, y + 1, x + 2, f"CPU {cpu_total:5.1f}%   GPU {gpu_total:5.1f}%", curses.A_BOLD)
     mem_lbl = "--" if p.gpu_mem_util_pct is None else f"{p.gpu_mem_util_pct:4.1f}%"
     safe_addstr(stdscr, y + 2, x + 2, f"GPU mem util: {mem_lbl}  cores: {len(p.gpu_core_utils) or p.gpu_core_count or 0}")
-    safe_addstr(stdscr, y + 3, x + 2, f"GPU W: {_fmt_opt_w(p.gpu_watts)}  CPU W: {_fmt_opt_w(p.cpu_watts)}")
+    safe_addstr(stdscr, y + 3, x + 2, f"GPU W: {_fmt_opt_w(p.gpu_watts)}  CPU W: {_fmt_opt_w(p.cpu_watts)}  ANE W: {_fmt_opt_w(p.ane_watts)}")
 
     rows = min((h - 5), max(len(data.cpu_core_utils), len(p.gpu_core_utils), 1))
     if rows <= 0:
@@ -193,7 +194,15 @@ def draw_top_detail(stdscr: curses.window, y: int, x: int, w: int, h: int, data:
         safe_addstr(stdscr, cy, x + 34, f"{g:4.0f}%")
 
 
-def draw_ui(stdscr: curses.window, data: PanelData, interval_ms: int, default_if: str, frame: int) -> None:
+def draw_ui(
+    stdscr: curses.window,
+    data: PanelData,
+    interval_ms: int,
+    default_if: str,
+    frame: int,
+    manual_scroll: int,
+    auto_scroll: bool,
+) -> None:
     stdscr.erase()
     max_y, max_x = stdscr.getmaxyx()
     if max_y < MIN_H or max_x < MIN_W:
@@ -204,7 +213,10 @@ def draw_ui(stdscr: curses.window, data: PanelData, interval_ms: int, default_if
         return
 
     now = time.strftime("%H:%M:%S")
-    header = f" aptop  phase-3  refresh={interval_ms}ms  iface={default_if}  q=quit r=reset  {now}"
+    header = (
+        f" aptop  phase-3  {now}  load {data.load_avg}  up {data.uptime}  iface {default_if}"
+        f"  q quit  r reset  j/k scroll  a auto({str(auto_scroll).lower()})  {interval_ms}ms "
+    )
     safe_addstr(stdscr, 0, 1, header[: max_x - 2], curses.A_BOLD | curses.color_pair(6))
 
     top_h = max_y // 2
@@ -239,8 +251,8 @@ def draw_ui(stdscr: curses.window, data: PanelData, interval_ms: int, default_if
     draw_box(stdscr, by, left_w, bottom_h, right_w, "5 proc")
 
     draw_progress(stdscr, by + 2, 2, mem_w - 4, "Used", data.mem_used_pct, pct_color(data.mem_used_pct))
-    draw_progress(stdscr, by + 4, 2, mem_w - 4, "Cached", data.mem_cached_pct, curses.color_pair(4))
-    draw_progress(stdscr, by + 6, 2, mem_w - 4, "Free", data.mem_free_pct, curses.color_pair(1))
+    draw_progress(stdscr, by + 4, 2, mem_w - 4, "Cached", data.mem_cached_pct, curses.color_pair(2))
+    draw_progress(stdscr, by + 6, 2, mem_w - 4, "Free", data.mem_free_pct, curses.color_pair(4))
     safe_addstr(stdscr, by + left_top_h - 2, 2, f"{data.mem_used_gb:.1f} GiB / {data.mem_total_gb:.1f} GiB")
 
     draw_progress(stdscr, by + 2, mem_w + 2, disk_w - 4, "Root", data.disk_used_pct, pct_color(data.disk_used_pct))
@@ -249,15 +261,16 @@ def draw_ui(stdscr: curses.window, data: PanelData, interval_ms: int, default_if
     net_y = by + left_top_h + 2
     net_h = max(6, left_bottom_h - 3)
     net_w = left_w - 4
-    draw_sparkline(stdscr, net_y, 2, net_h // 2, net_w, data.net_down, f"DOWN {data.net_down_human}", curses.color_pair(4))
+    draw_sparkline(stdscr, net_y, 2, net_h // 2, net_w, data.net_down, f"DOWN {data.net_down_human}", curses.color_pair(7))
     draw_sparkline(stdscr, net_y + net_h // 2, 2, net_h - (net_h // 2), net_w, data.net_up, f"UP   {data.net_up_human}", curses.color_pair(5))
 
     visible = max(1, bottom_h - 4)
-    scroll_offset = 0
+    scroll_offset = manual_scroll
     if len(data.proc_rows) > visible:
-        scroll_offset = (frame // 2) % len(data.proc_rows)
+        if auto_scroll:
+            scroll_offset = (frame // 2) % len(data.proc_rows)
     draw_processes(stdscr, by, left_w, bottom_h, right_w, data.proc_rows, scroll_offset)
 
-    footer = "Phase 3: modularized code + powermetrics/pmset/ioreg power telemetry with graceful fallback."
+    footer = "GPU mem/core util is best-effort on macOS; run with sudo for full powermetrics telemetry."
     safe_addstr(stdscr, max_y - 1, 1, footer[: max_x - 2], curses.color_pair(6))
     stdscr.refresh()

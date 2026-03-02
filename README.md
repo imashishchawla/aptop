@@ -27,6 +27,8 @@ Implemented:
 - Process pane behavior:
   - default sort is memory high to low
   - smooth auto-scroll when rows exceed visible space
+  - manual scrolling: `j`/`k` (auto-scroll pauses)
+  - toggle auto-scroll: `a`
 - Top detail behavior:
   - mirrored CPU graph style
   - CPU/GPU per-core bars
@@ -64,6 +66,8 @@ Use `sudo` to unlock full `powermetrics` telemetry.
 
 - `q`: quit
 - `r`: reset samplers
+- `j` / `k`: process scroll
+- `a`: toggle process auto-scroll
 
 ## Terminal size
 
