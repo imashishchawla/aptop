@@ -72,3 +72,7 @@ Use `sudo` to unlock full `powermetrics` telemetry.
 ## Terminal size
 
 Use at least `110x28`.
+
+## Planning blueprint
+
+- See `docs/apple-silicon-terminal-monitor-blueprint.md` for the consolidated btop/htop/nvtop feature inventory, add/keep/remove decisions, and efficiency strategy for Apple Silicon.
